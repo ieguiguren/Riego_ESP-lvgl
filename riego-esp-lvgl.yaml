@@ -1,0 +1,4541 @@
+# =====================================================================
+#  RIEGO ESP-LVGL  -  Controlador de riego táctil con ESPHome + LVGL
+#  Placa: Guition JC4827W543C (ESP32-S3, pantalla 4.3" 480x272)
+#
+#  Para personalizarlo solo tienes que tocar este bloque "substitutions"
+#  y crear tu fichero secrets.yaml (ver secrets.yaml.example).
+# =====================================================================
+substitutions:
+  # ---- PERSONALIZA AQUÍ -------------------------------------------
+  # Nombre del dispositivo en la red / ESPHome (minúsculas, sin espacios ni tildes)
+  nom: "riego-esp-lvgl"
+  # Nombre que verás en Home Assistant
+  amigable_nom: "Riego ESP LVGL"
+  # Texto de la barra superior de la pantalla (máx. ~15 caracteres), nombre del
+  # hotspot WiFi de emergencia ("<texto> FH") y del botón de reinicio
+  hostname: "Riego ESP LVGL"
+  # Zona horaria (lista: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
+  zona_horaria: "Europe/Madrid"
+  # ---- Claves (se leen de secrets.yaml, no las escribas aquí) ------
+  api: !secret api_encryption_key
+  ap: !secret ap_password
+  # GPIOs
+  sensor_lluvia_pin: GPIO15
+  # ids
+  sensor_lluvia_id: sensor_lluvia
+  #Nombres
+  estado_nom: Estado
+  luz_riego_nom: Luz riego
+  sensor_lluvia_nom: Lluvia
+
+esphome:
+  name: $nom
+  friendly_name: $amigable_nom
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: inactivity_timer
+      - component.update: my_display
+      - lvgl.label.update:
+          id: lbl_btn_zona_1
+          text: !lambda return id(nombre_zona1);
+      - lvgl.label.update:
+          id: lbl_btn_zona_2
+          text: !lambda return id(nombre_zona2);
+      - lvgl.label.update:
+          id: lbl_btn_zona_3
+          text: !lambda return id(nombre_zona3);
+      - lvgl.label.update:
+          id: lbl_btn_zona_4
+          text: !lambda return id(nombre_zona4);
+      - lvgl.label.update:
+          id: lbl_btn_zona_5
+          text: !lambda return id(nombre_zona5);
+      - lvgl.label.update:
+          id: lbl_btn_zona_6
+          text: !lambda return id(nombre_zona6);
+      - lvgl.label.update:
+          id: lbl_btn_zona_7
+          text: !lambda return id(nombre_zona7);
+      - lvgl.label.update:
+          id: lbl_btn_zona_8
+          text: !lambda return id(nombre_zona8);
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: y
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+  encryption:
+    key: $api
+
+ota:
+  - platform: esphome
+    encryption:
+      key: $api
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    - lvgl.widget.show: lbl_wifi
+  on_disconnect:
+    - lvgl.widget.hide: lbl_wifi
+  ap:
+    ssid: "$hostname FH"
+    password: $ap
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: $zona_horaria
+    servers:
+     - 0.pool.ntp.org
+     - 1.pool.ntp.org
+     - 2.pool.ntp.org
+    on_time_sync:
+      then:
+       - delay: 5s
+       - pcf8563.write_time: 
+       - lvgl.label.update:
+           id: lbl_hora_info
+           text: "Hora sincronizada con internet."
+  - platform: pcf8563
+    id: rtc_time
+    i2c_id: bus_b
+
+globals:
+  # Programas
+  - id: programa_actual
+    type: int
+
+  # Nombres de zonas
+  - id: nombre_zona1
+    type: std::string
+    initial_value: '"Zona 1"'
+    restore_value: true
+
+  - id: nombre_zona2
+    type: std::string
+    initial_value: '"Zona 2"'
+    restore_value: true
+
+  - id: nombre_zona3
+    type: std::string
+    initial_value: '"Zona 3"'
+    restore_value: true
+
+  - id: nombre_zona4
+    type: std::string
+    initial_value: '"Zona 4"'
+    restore_value: true
+
+  - id: nombre_zona5
+    type: std::string
+    initial_value: '"Zona 5"'
+    restore_value: true
+
+  - id: nombre_zona6
+    type: std::string
+    initial_value: '"Zona 6"'
+    restore_value: true
+
+  - id: nombre_zona7
+    type: std::string
+    initial_value: '"Zona 7"'
+    restore_value: true
+
+  - id: nombre_zona8
+    type: std::string
+    initial_value: '"Zona 8"'
+    restore_value: true
+
+  # Tiempo restante de zonas
+  - id: var_zona_restante
+    type: int[8]
+    initial_value: "{0, 0, 0, 0, 0, 0, 0, 0}"
+    restore_value: true
+
+  - id: var_dias_saltar_inicio
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  # ---- Lógica de lluvia ----
+  # Segundos de lluvia por hora, buffer circular de 24 h (ventana deslizante)
+  - id: lluvia_seg_hora
+    type: int[24]
+    initial_value: "{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}"
+    restore_value: true
+  # Última hora absoluta (epoch/3600) procesada, para limpiar buckets tras un apagón
+  - id: lluvia_hora_abs
+    type: uint32_t
+    initial_value: "0"
+    restore_value: true
+  - id: ultimo_minuto_eval
+    type: uint32_t
+    initial_value: "0"
+  # Factor que aplica SOLO el riego automático (1.0 = normal). Manual siempre 1.0
+  - id: factor_lluvia
+    type: float
+    initial_value: "1.0"
+  # 0 = saltar, 1 = reducido, 2 = normal
+  - id: decision_lluvia
+    type: int
+    initial_value: "2"
+
+  # Pantalla
+  - id: pantalla_durmiendo
+    type: bool
+    initial_value: "false"
+  - id: brillo_pantalla
+    type: float
+    initial_value: "0.75"
+    restore_value: true
+
+output:
+  # Backlight LED
+  - platform: ledc
+    pin:
+      number: 1
+    id: gpio_backlight_pwm
+    frequency: 1000Hz
+
+light:
+  # Luz de la pantalla
+  - platform: monochromatic
+    output: gpio_backlight_pwm
+    name: Display Backlight
+    icon: mdi:lightbulb-on
+    id: display_backlight
+    restore_mode: ALWAYS_ON
+
+binary_sensor:
+  # Estado de la conexión
+  - platform: status
+    name: $estado_nom
+  
+  - platform: gpio
+    id: $sensor_lluvia_id
+    pin: 
+      number: $sensor_lluvia_pin
+      mode:
+        input: true
+        pullup: true    # Define el estado, si es NO usa pullup si es NC usa pulldown.
+    name: $sensor_lluvia_nom
+    filters:
+      - invert:
+      - delayed_on: 500ms
+      - delayed_off: 500ms
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(riego_canal1).state || id(riego_canal2).state ||
+                      id(riego_canal3).state || id(riego_canal4).state ||
+                      id(riego_canal5).state || id(riego_canal6).state ||
+                      id(riego_canal7).state || id(riego_canal8).state;
+            then:
+              - logger.log: "Lloviendo mientras riega, ignorado"
+            else:
+              - lvgl.label.update:
+                  id: clima_ico
+                  text: !lambda |-
+                    if (id(sensor_lluvia).state) {
+                      return std::string("\U000F0597");
+                    } else {
+                      return std::string("\U000F0599");
+                    }
+                  text_color: !lambda |-
+                    if (id(sensor_lluvia).state) {
+                      return lv_color_hex(0x4FC3F7);
+                    } else {
+                      return lv_color_hex(0xFFD600);
+                    }
+
+i2c:
+  - id: bus_a
+    sda: GPIO8
+    scl: GPIO4
+    scan: true
+
+  - id: bus_b
+    sda: GPIO6
+    scl: GPIO7
+    scan: true
+    frequency: 100kHz
+
+xl9535:
+  - id: xl9535_8_hub
+    i2c_id: bus_b
+    address: 0x20
+
+select:
+  - platform: template
+    name: "Programa 1, inicio"
+    id: programa_1_inicio
+    options: &start_options
+      - "00:00"
+      - "00:15"
+      - "00:30"
+      - "00:45"
+      - "01:00"
+      - "01:15"
+      - "01:30"
+      - "01:45"
+      - "02:00"
+      - "02:15"
+      - "02:30"
+      - "02:45"
+      - "03:00"
+      - "03:15"
+      - "03:30"
+      - "03:45"
+      - "04:00"
+      - "04:15"
+      - "04:30"
+      - "04:45"
+      - "05:00"
+      - "05:15"
+      - "05:30"
+      - "05:45"
+      - "06:00"
+      - "06:15"
+      - "06:30"
+      - "06:45"
+      - "07:00"
+      - "07:15"
+      - "07:30"
+      - "07:45"
+      - "08:00"
+      - "08:15"
+      - "08:30"
+      - "08:45"
+      - "09:00"
+      - "09:15"
+      - "09:30"
+      - "09:45"
+      - "10:00"
+      - "10:15"
+      - "10:30"
+      - "10:45"
+      - "11:00"
+      - "11:15"
+      - "11:30"
+      - "11:45"
+      - "12:00"
+      - "12:15"
+      - "12:30"
+      - "12:45"
+      - "13:00"
+      - "13:15"
+      - "13:30"
+      - "13:45"
+      - "14:00"
+      - "14:15"
+      - "14:30"
+      - "14:45"
+      - "15:00"
+      - "15:15"
+      - "15:30"
+      - "15:45"
+      - "16:00"
+      - "16:15"
+      - "16:30"
+      - "16:45"
+      - "17:00"
+      - "17:15"
+      - "17:30"
+      - "17:45"
+      - "18:00"
+      - "18:15"
+      - "18:30"
+      - "18:45"
+      - "19:00"
+      - "19:15"
+      - "19:30"
+      - "19:45"
+      - "20:00"
+      - "20:15"
+      - "20:30"
+      - "20:45"
+      - "21:00"
+      - "21:15"
+      - "21:30"
+      - "21:45"
+      - "22:00"
+      - "22:15"
+      - "22:30"
+      - "22:45"
+      - "23:00"
+      - "23:15"
+      - "23:30"
+      - "23:45"
+    initial_option: "06:30"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lvgl.roller.update:
+          id: prog_1_inicio
+          selected_index: !lambda |-
+            const auto& opts = id(programa_1_inicio).traits.get_options();
+            for (size_t i = 0; i < opts.size(); i++) {
+              if (std::string(opts[i]) == x) return (int)i;
+            }
+            return 0;
+  - platform: template
+    name: "Programa 2, inicio"
+    id: programa_2_inicio
+    options: *start_options
+    initial_option: "11:45"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lvgl.roller.update:
+          id: prog_2_inicio
+          selected_index: !lambda |-
+            const auto& opts = id(programa_2_inicio).traits.get_options();
+            for (size_t i = 0; i < opts.size(); i++) {
+              if (std::string(opts[i]) == x) return (int)i;
+            }
+            return 0;
+
+  - platform: template
+    name: "Programa 3, inicio"
+    id: programa_3_inicio
+    options: *start_options
+    initial_option: "19:00"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lvgl.roller.update:
+          id: prog_3_inicio
+          selected_index: !lambda |-
+            const auto& opts = id(programa_3_inicio).traits.get_options();
+            for (size_t i = 0; i < opts.size(); i++) {
+              if (std::string(opts[i]) == x) return (int)i;
+            }
+            return 0;
+
+  - platform: template
+    name: "Programa 4, inicio"
+    id: programa_4_inicio
+    options: *start_options
+    initial_option: "22:15"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lvgl.roller.update:
+          id: prog_4_inicio
+          selected_index: !lambda |-
+            const auto& opts = id(programa_4_inicio).traits.get_options();
+            for (size_t i = 0; i < opts.size(); i++) {
+              if (std::string(opts[i]) == x) return (int)i;
+            }
+            return 0;
+
+switch:
+  # Reinicio esp
+  - platform: restart
+    name: $hostname reiniciar
+  
+  # Lógica de lluvia activada / desactivada (desactivada = riego automático normal)
+  - platform: template
+    id: lluvia_activa
+    name: "Sensor de lluvia activo"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lvgl.widget.update:
+            id: btn_lluvia_activa
+            state:
+              checked: true
+        - lvgl.label.update:
+            id: lbl_lluvia_activa
+            text: "Sensor: ACTIVO"
+        - lvgl.label.update:
+            id: ico_inicio_lluvia
+            text: "\U000F0208"
+            text_color: 0x1F8F3A
+        - lvgl.label.update:
+            id: lbl_inicio_lluvia
+            text: "Sensor lluvia: ACTIVO"
+            text_color: 0x1F8F3A
+    on_turn_off:
+      then:
+        - lvgl.widget.update:
+            id: btn_lluvia_activa
+            state:
+              checked: false
+        - lvgl.label.update:
+            id: lbl_lluvia_activa
+            text: "Sensor: DESACTIVADO"
+        - lvgl.label.update:
+            id: ico_inicio_lluvia
+            text: "\U000F0209"
+            text_color: 0xF57F02
+        - lvgl.label.update:
+            id: lbl_inicio_lluvia
+            text: "Sensor lluvia: OFF"
+            text_color: 0xF57F02
+
+  # Programas 1-4
+  - platform: template
+    id: programa_1
+    name: "Programa riego 1"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p1
+            state:
+              checked: true
+    on_turn_off:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p1
+            state:
+              checked: false
+
+  - platform: template
+    id: programa_2
+    name: "Programa riego 2"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p2
+            state:
+              checked: true
+    on_turn_off:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p2
+            state:
+              checked: false
+
+  - platform: template
+    id: programa_3
+    name: "Programa riego 3"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p3
+            state:
+              checked: true
+    on_turn_off:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p3
+            state:
+              checked: false
+
+  - platform: template
+    id: programa_4
+    name: "Programa riego 4"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p4
+            state:
+              checked: true
+    on_turn_off:
+      then:
+        - lvgl.widget.update:
+            id: btn_ajuste_p4
+            state:
+              checked: false
+
+  - platform: template
+    name: "Riego zona 1"
+    id: riego_zona1
+    lambda: 'return id(riego_canal1).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal1
+      - script.execute: zona1_espera
+      - script.wait: zona1_espera
+      - switch.turn_off: riego_canal1
+    turn_off_action:
+      - script.stop: zona1_espera
+      - lambda: |-
+          id(var_zona_restante)[0] = 0;
+          id(zona1_restante).update();
+      - switch.turn_off: riego_canal1
+
+  - platform: template
+    name: "Riego zona 2"
+    id: riego_zona2
+    lambda: 'return id(riego_canal2).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal2
+      - script.execute: zona2_espera
+      - script.wait: zona2_espera
+      - switch.turn_off: riego_canal2
+    turn_off_action:
+      - script.stop: zona2_espera
+      - lambda: |-
+          id(var_zona_restante)[1] = 0;
+          id(zona2_restante).update();
+      - switch.turn_off: riego_canal2
+
+  - platform: template
+    name: "Riego zona 3"
+    id: riego_zona3
+    lambda: 'return id(riego_canal3).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal3
+      - script.execute: zona3_espera
+      - script.wait: zona3_espera
+      - switch.turn_off: riego_canal3
+    turn_off_action:
+      - script.stop: zona3_espera
+      - lambda: |-
+          id(var_zona_restante)[2] = 0;
+          id(zona3_restante).update();
+      - switch.turn_off: riego_canal3
+
+  - platform: template
+    name: "Riego zona 4"
+    id: riego_zona4
+    lambda: 'return id(riego_canal4).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal4
+      - script.execute: zona4_espera
+      - script.wait: zona4_espera
+      - switch.turn_off: riego_canal4
+    turn_off_action:
+      - script.stop: zona4_espera
+      - lambda: |-
+          id(var_zona_restante)[3] = 0;
+          id(zona4_restante).update();
+      - switch.turn_off: riego_canal4
+
+  - platform: template
+    name: "Riego zona 5"
+    id: riego_zona5
+    lambda: 'return id(riego_canal5).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal5
+      - script.execute: zona5_espera
+      - script.wait: zona5_espera
+      - switch.turn_off: riego_canal5
+    turn_off_action:
+      - script.stop: zona5_espera
+      - lambda: |-
+          id(var_zona_restante)[4] = 0;
+          id(zona5_restante).update();
+      - switch.turn_off: riego_canal5
+
+  - platform: template
+    name: "Riego zona 6"
+    id: riego_zona6
+    lambda: 'return id(riego_canal6).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal6
+      - script.execute: zona6_espera
+      - script.wait: zona6_espera
+      - switch.turn_off: riego_canal6
+    turn_off_action:
+      - script.stop: zona6_espera
+      - lambda: |-
+          id(var_zona_restante)[5] = 0;
+          id(zona6_restante).update();
+      - switch.turn_off: riego_canal6
+
+  - platform: template
+    name: "Riego zona 7"
+    id: riego_zona7
+    lambda: 'return id(riego_canal7).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal7
+      - script.execute: zona7_espera
+      - script.wait: zona7_espera
+      - switch.turn_off: riego_canal7
+    turn_off_action:
+      - script.stop: zona7_espera
+      - lambda: |-
+          id(var_zona_restante)[6] = 0;
+          id(zona7_restante).update();
+      - switch.turn_off: riego_canal7
+
+  - platform: template
+    name: "Riego zona 8"
+    id: riego_zona8
+    lambda: 'return id(riego_canal8).state;'
+    turn_on_action:
+      - switch.turn_on: riego_canal8
+      - script.execute: zona8_espera
+      - script.wait: zona8_espera
+      - switch.turn_off: riego_canal8
+    turn_off_action:
+      - script.stop: zona8_espera
+      - lambda: |-
+          id(var_zona_restante)[7] = 0;
+          id(zona8_restante).update();
+      - switch.turn_off: riego_canal8
+
+  # Canales de riego (1-8)
+  - platform: gpio
+    id: riego_canal1
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 0
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 1
+      - lvgl.widget.update:
+            id: btn_zona_1
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 1"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_1
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 1"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+  - platform: gpio
+    id: riego_canal2
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 1
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 2
+      - lvgl.widget.update:
+            id: btn_zona_2
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 2"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_2
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 2"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+  - platform: gpio
+    id: riego_canal3
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 2
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 3
+      - lvgl.widget.update:
+            id: btn_zona_3
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 3"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_3
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 3"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+  - platform: gpio
+    id: riego_canal4
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 3
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 4
+      - lvgl.widget.update:
+            id: btn_zona_4
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 4"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_4
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 4"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+  - platform: gpio
+    id: riego_canal5
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 4
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 5
+      - lvgl.widget.update:
+            id: btn_zona_5
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 5"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_5
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 5"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+  - platform: gpio
+    id: riego_canal6
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 5
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 6
+      - lvgl.widget.update:
+            id: btn_zona_6
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 6"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_6
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 6"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+  - platform: gpio
+    id: riego_canal7
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 6
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 7
+      - lvgl.widget.update:
+            id: btn_zona_7
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 7"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_7
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 7"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+  - platform: gpio
+    id: riego_canal8
+    restore_mode: ALWAYS_OFF
+    pin:
+      xl9535: xl9535_8_hub
+      number: 7
+      mode:
+        output: true
+      inverted: false
+    on_turn_on:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Regando zona 8
+      - lvgl.widget.update:
+            id: btn_zona_8
+            state:
+              checked: true
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 8"
+          hidden: false
+      - lvgl.label.update:
+          id: clima_ico
+          text: "\U000F1060"
+          text_color: 0x4FC3F7
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: false
+          text_color: 0x4FC3F7
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: false
+          spin_time: 500ms
+          arc_color: 0x31de70
+          indicator:
+            arc_color: 0xffbc02
+    on_turn_off:
+      - lvgl.label.update:
+            id: lbl_estado
+            text: Riego esperando a la hora
+      - lvgl.widget.update:
+            id: btn_zona_8
+            state:
+              checked: false
+      - lvgl.label.update:
+          id: lbl_zona_regando
+          text: "Zona 8"
+          hidden: true
+      - lvgl.label.update:
+          id: lbl_tiempo_restante
+          hidden: true
+      - lvgl.spinner.update:
+          id: spinner_id
+          hidden: true
+      - lvgl.label.update:
+          id: clima_ico
+          text: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return std::string("\U000F0597");
+            } else {
+              return std::string("\U000F0599");
+            }
+          text_color: !lambda |-
+            if (id(sensor_lluvia).state) {
+              return lv_color_hex(0x4FC3F7);
+            } else {
+              return lv_color_hex(0xFFD600);
+            }
+
+number:
+# Duración de zonas (1-8)
+  - platform: lvgl
+    widget: spin_zona1_inicio
+    id: zona1_duracion
+    name: "zona 1 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_zona2_inicio
+    id: zona2_duracion
+    name: "zona 2 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_zona3_inicio
+    id: zona3_duracion
+    name: "zona 3 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_zona4_inicio
+    id: zona4_duracion
+    name: "zona 4 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_zona5_inicio
+    id: zona5_duracion
+    name: "zona 5 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_zona6_inicio
+    id: zona6_duracion
+    name: "zona 6 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_zona7_inicio
+    id: zona7_duracion
+    name: "zona 7 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_zona8_inicio
+    id: zona8_duracion
+    name: "zona 8 duración"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  # Multiplicador de tiempo
+  - platform: lvgl
+    widget: dm_multiplicador_spinbox
+    id: multiplicador_tiempo
+    name: "Multiplicador de tiempo"
+    mode: box
+    unit_of_measurement: "%"
+    restore_value: true
+
+  # Saltar días  
+  - platform: lvgl
+    widget: dm_saltar_dias_spinbox
+    id: saltar_dias
+    name: "Saltar dias"
+    mode: box
+    unit_of_measurement: "días"
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            id(var_dias_saltar_inicio) = id(rtc_time).now().timestamp / 86400;
+  
+  # Luz de pantalla.
+  - platform: lvgl
+    widget: dm_brillo_tiempo_slider
+    name: Tiempo de iluminacion de pantalla
+    trigger: on_value
+    id: sleep_time
+    unit_of_measurement: "s"
+    restore_value: true
+    mode: box
+
+  # ---- Lógica de lluvia (solo riego automático), se ajusta en Ajustes > Lluvia ----
+  - platform: lvgl
+    widget: spin_lluvia_reducir
+    id: lluvia_umbral_reducir
+    name: "Lluvia: reducir riego desde"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_lluvia_factor
+    id: lluvia_factor_reducido
+    name: "Lluvia: tiempo de riego reducido"
+    mode: box
+    unit_of_measurement: "%"
+    restore_value: true
+
+  - platform: lvgl
+    widget: spin_lluvia_saltar
+    id: lluvia_umbral_saltar
+    name: "Lluvia: saltar riego desde"
+    mode: box
+    unit_of_measurement: min
+    restore_value: true
+
+sensor:
+  - platform: template
+    id: zona1_restante
+    name: "Zona 1, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[0];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal1).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  - platform: template
+    id: zona2_restante
+    name: "Zona 2, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[1];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal2).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  - platform: template
+    id: zona3_restante
+    name: "Zona 3, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[2];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal3).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  - platform: template
+    id: zona4_restante
+    name: "Zona 4, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[3];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal4).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  - platform: template
+    id: zona5_restante
+    name: "Zona 5, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[4];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal5).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  - platform: template
+    id: zona6_restante
+    name: "Zona 6, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[5];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal6).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  - platform: template
+    id: zona7_restante
+    name: "Zona 7, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[6];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal7).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  - platform: template
+    id: zona8_restante
+    name: "Zona 8, restante"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    lambda: "return id(var_zona_restante)[7];"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(riego_canal8).state;
+            then:
+              - lvgl.label.update:
+                  id: lbl_tiempo_restante
+                  text: !lambda |-
+                    return str_sprintf("%02d min", (int)x);
+
+  # Minutos de lluvia en las últimas 24 h
+  - platform: template
+    id: lluvia_24h
+    name: "Lluvia últimas 24 h"
+    accuracy_decimals: 0
+    unit_of_measurement: min
+    update_interval: 60s
+    lambda: |-
+      int s = 0;
+      for (int i = 0; i < 24; i++) s += id(lluvia_seg_hora)[i];
+      return s / 60.0f;
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_lluvia_24h
+            text: !lambda |-
+              return str_sprintf("24 h: %d min", (int) x);
+
+text_sensor:
+  - platform: lvgl
+    widget: ta_nombre_z1
+    id: ts_nombre_z1
+    name: "Nombre zona 1"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona1
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_1
+            text: !lambda return x;
+
+  - platform: lvgl
+    widget: ta_nombre_z2
+    id: ts_nombre_z2
+    name: "Nombre zona 2"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona2
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_2
+            text: !lambda return x;
+
+  - platform: lvgl
+    widget: ta_nombre_z3
+    id: ts_nombre_z3
+    name: "Nombre zona 3"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona3
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_3
+            text: !lambda return x;
+
+  - platform: lvgl
+    widget: ta_nombre_z4
+    id: ts_nombre_z24
+    name: "Nombre zona 4"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona4
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_4
+            text: !lambda return x;
+
+  - platform: lvgl
+    widget: ta_nombre_z5
+    id: ts_nombre_z5
+    name: "Nombre zona 5"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona5
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_5
+            text: !lambda return x;
+
+  - platform: lvgl
+    widget: ta_nombre_z6
+    id: ts_nombre_z6
+    name: "Nombre zona 6"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona6
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_6
+            text: !lambda return x;
+
+  - platform: lvgl
+    widget: ta_nombre_z7
+    id: ts_nombre_z7
+    name: "Nombre zona 7"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona7
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_7
+            text: !lambda return x;
+
+  - platform: lvgl
+    widget: ta_nombre_z8
+    id: ts_nombre_z28
+    name: "Nombre zona 8"
+    on_value:
+      then:
+        - globals.set:
+            id: nombre_zona8
+            value: !lambda return x;
+        - lvgl.label.update:
+            id: lbl_btn_zona_8
+            text: !lambda return x;
+
+  # Qué decidió el riego automático la última vez
+  - platform: template
+    id: decision_riego_txt
+    name: "Última decisión de riego"
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_lluvia_decision
+            text: !lambda |-
+              return std::string("Ultima: ") + x;
+
+button:
+  - platform: template
+    name: "Borrar histórico de lluvia"
+    entity_category: config
+    on_press:
+      - script.execute: borrar_historial_lluvia
+
+touchscreen:
+  - platform: gt911
+    id: my_touchscreen
+    i2c_id: bus_a
+    interrupt_pin:
+      number: 3
+      ignore_strapping_warning: true
+    #reset_pin: GPIO38
+    transform:
+      mirror_x: true
+      mirror_y: true
+    on_touch:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(pantalla_durmiendo);'
+            then:
+              - globals.set:
+                  id: pantalla_durmiendo
+                  value: "false"
+              # Reanudar LVGL antes de encender la luz para no ver la "nieve"
+              - if:
+                  condition: lvgl.is_paused
+                  then:
+                    - lvgl.resume:
+                    - lvgl.widget.redraw:
+                    - delay: 200ms
+              - light.turn_on: display_backlight
+              - delay: 2s
+              #- lvgl.page.show: pagina_inicio
+              - script.execute: inactivity_timer
+            else:
+              - script.execute: inactivity_timer
+
+spi:
+  id: quad_spi
+  type: quad
+  clk_pin: GPIO47
+  data_pins: [21,48,40,39]
+
+display:
+  - platform: mipi_spi
+    id: my_display
+    model: JC4827W543
+    bus_mode: quad
+    #dimensions:
+      #width: 480
+      #height: 272
+    cs_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    #data_rate: 20MHz
+    invert_colors: true
+    update_interval: never
+    auto_clear_enabled: false
+    show_test_card: false 
+
+font:
+  - file: "gfonts://Roboto"
+    id: roboto_24
+    size: 24
+
+  - file: "gfonts://Roboto"
+    id: roboto_16
+    size: 16
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: materialdesignicons_18
+    size: 18
+    glyphs:
+      - "\U000F05A9"  # wifi
+      - "\U000F0425"  # power icon
+      - "\U000F08BB"  # cog-outline
+      - "\U000F0140"  # chevron-down
+      - "\U000F0143"  # chevron-up
+      - "\U000F0530"  # transfer-right
+      - "\U000F0208"  # eye
+      - "\U000F0209"  # eye-off
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: materialdesignicons_28
+    size: 28
+    glyphs:
+      - "\U000F08BB"  # cog-outline
+      - "\U000F0335"  # lightbulb
+      - "\U000F105F"  # sprinkler
+      - "\U000F0597"  # weather-rainy
+      - "\U000F1482"  # watering-can-outline
+      - "\U000F0CF2"  # brightness-percent
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: materialdesignicons_34
+    size: 34
+    glyphs:
+      - "\U000F0599"  # weather-sunny
+      - "\U000F08BB"  # cog-outline
+      - "\U000F1482"  # watering-can-outline
+      - "\U000F1C20"  # auto-mode
+      - "\U000F0CF2"  # brightness-percent
+      - "\U000F154A"  # sort-clock-ascending-outline
+      - "\U000F0DBB"  # chevron-triple-right
+      - "\U000F1AE2"  # timer-plus
+      - "\U000F01B7"  # debug-step-over
+      - "\U000F058E"  # water-percent
+      - "\U000F0433"  # qrcode-scan
+      - "\U000F0157"  # close-box
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: materialdesignicons_180
+    size: 180
+    glyphs:
+      - "\U000F0599"  # weather-sunny
+      - "\U000F0597"  # lluvia
+      - "\U000F1060"  # sprinkler-variant
+      - "\U000F08BB"  # cog-outline
+      - "\U000F1482"  # watering-can-outline
+      - "\U000F1C20"  # auto-mode
+
+lvgl:
+  displays:
+    - my_display
+  touchscreens:
+    - my_touchscreen
+  setup_priority: 1
+  buffer_size: 25%
+
+  theme:
+    button:
+      bg_color: 0x4A4A4A
+      bg_grad_color: 0x3A3A3A
+      bg_grad_dir: VER
+      bg_opa: COVER
+      border_color: 0x666666
+      border_width: 1
+      text_color: 0xFFFFFF
+      pressed:
+        bg_color: 0x2E2E2E
+        bg_grad_color: 0x1F1F1F
+      checked:
+        bg_color: 0x1F8F3A
+        bg_grad_color: 0x0B5E22
+        text_color: 0xFFFFFF
+        border_color: 0x2FBF4A
+    roller:
+      bg_color: 0x5A5A5A
+      bg_grad_color: 0x4A4A4A
+      bg_grad_dir: VER
+      bg_opa: COVER
+      border_color: 0x666666
+      border_width: 1
+      radius: 5
+      text_color: 0x888888
+      #text_font: roboto_16
+      selected:
+        bg_color: 0x1F8F3A
+        bg_grad_color: 0x0B5E22
+        bg_grad_dir: VER
+        bg_opa: COVER
+        text_color: 0xFFFFFF
+        border_color: 0x2FBF4A
+        border_width: 1
+    buttonmatrix:
+      bg_opa: TRANSP
+      border_color: 0x0077b3
+      border_width: 0
+      text_color: 0xFFFFFF
+      pad_all: 0
+      items: # set all your buttonmatrix buttons to use your custom defined styles and font
+        bg_color: 0x2F8CD8
+        bg_grad_color: 0x005782
+        bg_grad_dir: VER
+        bg_opa: COVER
+        border_color: 0x0077b3
+        border_width: 1
+        text_color: 0xFFFFFF
+        text_font: roboto_24
+        pressed:
+          bg_color: 0xA914FF
+          bg_grad_color: 0xFF1462
+        checked:
+          bg_color: 0x1d5f96
+          bg_grad_color: 0x03324A
+          text_color: 0x005580
+    switch:
+      bg_color: 0xC0C0C0
+      bg_grad_color: 0xb0b0b0
+      bg_grad_dir: VER
+      bg_opa: COVER
+      checked:
+        bg_color: 0x1d5f96
+        bg_grad_color: 0x03324A
+        bg_grad_dir: VER
+        bg_opa: COVER
+      knob:
+        bg_color: 0xFFFFFF
+        bg_grad_color: 0xC0C0C0
+        bg_grad_dir: VER
+        bg_opa: COVER
+    slider:
+      border_width: 1
+      #border_opa: 15%
+      bg_color: 0x0F1929
+      #bg_opa: 15%
+      indicator:
+        bg_color: 0xFBBF24
+        bg_grad_color: 0x03324A
+        bg_grad_dir: VER
+        bg_opa: 35%
+        shadow_color: 0xFBBF24
+        shadow_opa: cover
+        shadow_spread: 1
+        shadow_width: 4
+        radius: 8
+      knob:
+        bg_color: 0xFFFFFF
+        bg_opa: 85%
+        border_width: 2
+        border_color: 0x58ED22
+        radius: 50
+        pad_all: 0
+
+  style_definitions:
+    - id: cabecera
+      bg_color: green
+      bg_grad_color: 0x9ABF40
+      bg_grad_dir: VER
+      bg_opa: 15%
+      border_opa: 90%
+      radius: 5
+      pad_all: 0
+      pad_row: 0
+      pad_column: 1
+      border_color: 0x0077b3
+      text_color: 0xFFFFFF
+      width: 100%
+      height: 30
+
+    - id: centro
+      bg_color: 0x056C28
+      bg_grad_color: 0x36E672
+      bg_grad_dir: VER
+      bg_opa: TRANSP
+      border_opa: TRANSP
+      radius: 4
+      pad_all: 2
+      pad_row: 1
+      pad_column: 3
+      border_color: 0x0077b3
+      text_color: 0x000000
+      width: 100%
+      height: 200
+      y: 30
+
+    - id: header_footer
+      bg_color: 0x4E8252
+      bg_grad_color: 0x03FF6C
+      bg_grad_dir: VER
+      bg_opa: COVER
+      border_opa: 90%
+      radius: 5
+      pad_all: 0
+      pad_row: 0
+      pad_column: 0
+      border_color: 0x472D03
+      text_color: 0xFFFFFF
+      width: 100%
+      height: 30
+
+    - id: pantalla_inactiva
+      bg_color: 0x056C28
+      bg_grad_color: 0x36E672
+      bg_grad_dir: VER
+      bg_opa: TRANSP
+      border_opa: TRANSP
+      radius: 4
+      pad_all: 2
+      pad_row: 1
+      pad_column: 3
+      border_color: 0x0077b3
+      text_color: 0x000000
+      width: 100%
+      height: 200
+
+  top_layer:
+    widgets:
+      - label:
+          text: "$hostname"
+          align: TOP_LEFT
+          text_align: CENTER
+          x: 5
+          y: 9
+
+      - label:
+          id: lbl_reloj
+          align: TOP_MID
+          y: 5
+          text_color: 0xFE702B       
+          text_align: center
+          text_font: montserrat_24
+          text: "--:--:--"
+
+      - label:
+          id: lbl_estado
+          align: TOP_RIGHT
+          width: 120
+          x: -45
+          y: 5
+          border_width: 1
+          border_opa: TRANSP
+          radius: 50
+          text_color: 0xFE702B       
+          text_align: center
+          text_font: montserrat_20
+          text: "Estado de riego automatico"
+          long_mode: SCROLL_CIRCULAR
+      
+      - label:
+          id: lbl_wifi
+          hidden: true
+          align: top_right
+          width: 20
+          height: 20
+          x: -5
+          y: 5
+          styles: cabecera
+          text_font: materialdesignicons_18
+          text: "\U000F05A9"
+          text_align: right
+          text_color: black    
+
+      - buttonmatrix:
+          align: bottom_mid
+          styles: header_footer
+          pad_all: 0
+          outline_width: 0
+          id: top_layer
+          items:
+            styles: header_footer
+          rows:
+            - buttons:
+              - id: nav_inicio
+                text: "Inicio"
+                on_press:
+                  then:
+                    lvgl.page.show: pagina_inicio
+              - id: nav_programas
+                text: "Programas"
+                on_press:
+                  then:
+                    lvgl.page.show: pagina_programas
+              - id: nav_austes
+                text: "Ajustes"
+                on_press:
+                  then:
+                    lvgl.page.show: pagina_ajustes
+
+  pages:
+    - id: pagina_inicio
+      widgets:   
+        - container:
+            align: CENTER
+            width: 100%
+            height: 75%
+            x: 10
+            y: 7
+            widgets:          
+              - container:
+                  widgets:
+                    - label:
+                        id: lbl_zona_regando
+                        align: left_mid
+                        x: 20
+                        text_color: 0x1F8F3A
+                        text_font: montserrat_24
+                        text: ""
+                        hidden: true
+                    - label:
+                        id: clima_ico
+                        align: CENTER
+                        x: -20
+                        y: -20
+                        text_color: 0x000000
+                        text_font: materialdesignicons_180
+                        text: "\U000F0599"
+                    - label:
+                        id: lbl_espacio
+                        align: right_mid
+                        x: -40
+                        y: 0
+                        text_color: 0xFFFFFF
+                        text_font: montserrat_24
+                        text: "    "
+                        hidden: true
+              - label:
+                  id: lbl_tiempo_restante
+                  align: right_mid
+                  x: -40
+                  y: 0
+                  text_color: 0xFFFFFF
+                  text_font: montserrat_24
+                  text: "--"
+                  hidden: true
+              - spinner:
+                  id: spinner_id
+                  align: right_mid
+                  x: -20
+                  y: 0
+                  spin_time: 15s
+                  arc_length: 60deg
+                  bg_color: 0x1F8F3A
+                  indicator:
+                    arc_color: 0x18bcf2
+                  hidden: true 
+
+        # Estado del sensor de lluvia (activo / desactivado), bajo el icono grande
+        - container:
+            align: BOTTOM_MID
+            y: -42
+            width: 280
+            height: 26
+            pad_all: 0
+            bg_opa: TRANSP
+            border_opa: TRANSP
+            scrollable: false
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: CENTER
+              flex_align_cross: CENTER
+              pad_column: 6
+            widgets:
+              - label:
+                  id: ico_inicio_lluvia
+                  text_color: 0x1F8F3A
+                  text_font: materialdesignicons_18
+                  text: "\U000F0208"  # eye
+              - label:
+                  id: lbl_inicio_lluvia
+                  text_color: 0x1F8F3A
+                  text_font: montserrat_16
+                  text: "Sensor lluvia: ACTIVO"
+
+    - id: pagina_programas
+      widgets:
+        # Programas (1-4)
+        - container:
+            align: left_mid
+            width: 33%
+            height: 75%
+            x: 10
+            y: -3
+            pad_all: 6
+            layout:
+              type: GRID
+              grid_rows:
+                - FR(1)
+                - FR(1)
+                - FR(1)
+                - FR(1)
+              grid_columns:
+                - FR(2)
+                - FR(1)
+              pad_row: 6
+              pad_column: 6
+            widgets:
+              # Ajuste programa 1.
+              - button:
+                  id: btn_ajuste_p1
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: start
+                  width: 100%
+                  height: 35
+                  on_click:
+                    then:
+                      - switch.toggle: programa_1
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Prog. 1"
+              - roller:
+                  id: prog_1_inicio
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: end
+                  width: 50%
+                  height: 35
+                  options: *start_options
+                  selected_index: 26
+                  mode: NORMAL
+                  on_value:
+                    then:
+                      - lambda: |-
+                          const auto &opts = id(programa_1_inicio).traits.get_options();
+                          if (x >= opts.size()) return;
+                          auto idx = id(programa_1_inicio).active_index();
+                          if (idx.has_value() && idx.value() == x) return;  // evita el bucle select <-> roller
+                          auto call = id(programa_1_inicio).make_call();
+                          call.set_index(x);
+                          call.perform();
+
+              # Ajuste programa 2.
+              - button:
+                  id: btn_ajuste_p2
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: start
+                  width: 100%
+                  height: 35
+                  on_click:
+                    then:
+                      - switch.toggle: programa_2
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Prog. 2"
+              - roller:
+                  id: prog_2_inicio
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: end
+                  width: 50%
+                  height: 35
+                  options: *start_options
+                  selected_index: 26
+                  mode: NORMAL
+                  on_value:
+                    then:
+                      - lambda: |-
+                          const auto &opts = id(programa_2_inicio).traits.get_options();
+                          if (x >= opts.size()) return;
+                          auto idx = id(programa_2_inicio).active_index();
+                          if (idx.has_value() && idx.value() == x) return;  // evita el bucle select <-> roller
+                          auto call = id(programa_2_inicio).make_call();
+                          call.set_index(x);
+                          call.perform();
+
+              # Ajuste programa 3.
+              - button:
+                  id: btn_ajuste_p3
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: start
+                  width: 100%
+                  height: 35
+                  on_click:
+                    then:
+                      - switch.toggle: programa_3
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Prog. 3"
+              - roller:
+                  id: prog_3_inicio
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: end
+                  width: 50%
+                  height: 35
+                  options: *start_options
+                  selected_index: 72
+                  mode: NORMAL
+                  on_value:
+                    then:
+                      - lambda: |-
+                          const auto &opts = id(programa_3_inicio).traits.get_options();
+                          if (x >= opts.size()) return;
+                          auto idx = id(programa_3_inicio).active_index();
+                          if (idx.has_value() && idx.value() == x) return;  // evita el bucle select <-> roller
+                          auto call = id(programa_3_inicio).make_call();
+                          call.set_index(x);
+                          call.perform();
+
+              # Ajuste programa 4.
+              - button:
+                  id: btn_ajuste_p4
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: start
+                  width: 100%
+                  height: 35
+                  on_click:
+                    then:
+                      - switch.toggle: programa_4
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Prog. 4"
+              - roller:
+                  id: prog_4_inicio
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: end
+                  width: 50%
+                  height: 35
+                  options: *start_options
+                  selected_index: 88
+                  mode: NORMAL
+                  on_value:
+                    then:
+                      - lambda: |-
+                          const auto &opts = id(programa_4_inicio).traits.get_options();
+                          if (x >= opts.size()) return;
+                          auto idx = id(programa_4_inicio).active_index();
+                          if (idx.has_value() && idx.value() == x) return;  // evita el bucle select <-> roller
+                          auto call = id(programa_4_inicio).make_call();
+                          call.set_index(x);
+                          call.perform();
+        
+        # zonas (1-8)
+        - container:
+            align: right_mid
+            width: 65%
+            height: 75%
+            pad_all: 6
+            x: -5
+            y: -5
+            layout:
+              type: GRID
+              pad_row: 2
+              pad_column: 8
+
+              grid_rows:
+                - FR(1)
+                - FR(1)
+                - FR(1)
+                - FR(1)
+
+              grid_columns:
+                - FR(2)
+                - FR(3)
+                - FR(2)
+                - FR(3)
+
+            widgets:
+              - button:
+                  id: btn_zona_1
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona1
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_1
+                        text: "Z. 1"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z1
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona1_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona1_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z1
+                                text: !lambda return id(nombre_zona1);
+                            - lvgl.widget.show: popup_nombre_z1
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z1
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona1_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+
+              - button:
+                  id: btn_zona_2
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 2
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona2
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN_WRAP
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_2
+                        text: "Z. 2"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 3
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z2
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona2_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona2_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z2
+                                text: !lambda return id(nombre_zona2);
+                            - lvgl.widget.show: popup_nombre_z2
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z2
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona2_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+
+              - button:
+                  id: btn_zona_3
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona3
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN_WRAP
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_3
+                        text: "Z. 3"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z3
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona3_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona3_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z3
+                                text: !lambda return id(nombre_zona3);
+                            - lvgl.widget.show: popup_nombre_z3
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z3
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona3_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+
+              - button:
+                  id: btn_zona_4
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 2
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona4
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN_WRAP
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_4
+                        text: "Z. 4"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 3
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z4
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona4_inicio
+                        widgets:
+                          - label:
+                              align: TOP_MID
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona4_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z4
+                                text: !lambda return id(nombre_zona4);
+                            - lvgl.widget.show: popup_nombre_z4
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z4
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona4_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+
+              - button:
+                  id: btn_zona_5
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona5
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN_WRAP
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_5
+                        text: "Z. 5"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z5
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona5_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona5_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z5
+                                text: !lambda return id(nombre_zona5);
+                            - lvgl.widget.show: popup_nombre_z5
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z5
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona5_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+
+              - button:
+                  id: btn_zona_6
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 2
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona6
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN_WRAP
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_6
+                        text: "Z. 6"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 3
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z6
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona6_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona6_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z6
+                                text: !lambda return id(nombre_zona6);
+                            - lvgl.widget.show: popup_nombre_z6
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z6
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona6_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+
+              - button:
+                  id: btn_zona_7
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona7
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN_WRAP
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_7
+                        text: "Z. 7"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z7
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona7_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona7_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z7
+                                text: !lambda return id(nombre_zona7);
+                            - lvgl.widget.show: popup_nombre_z7
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z7
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona7_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+
+              - button:
+                  id: btn_zona_8
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 2
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  height: 40
+                  pad_top: 0
+                  pad_bottom: 0
+                  pad_left: 2
+                  pad_right: 2
+                  on_click:
+                    then:                      
+                      - switch.toggle: riego_zona8
+                  layout:
+                    type: FLEX
+                    flex_flow: COLUMN_WRAP
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        id: lbl_btn_zona_8
+                        text: "Z. 8"
+                        long_mode: SCROLL_CIRCULAR
+                        anim_duration: 10s
+                        width: 100%
+                    - label:
+                        text_font: materialdesignicons_18
+                        y: -10
+                        text: "\U000F0425"  # power icon
+
+              - container:
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 3
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_z8
+                        width: 20
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: spin_zona8_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_zona8_inicio
+                        width: 40
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 60
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        on_long_press:
+                          then:
+                            - lvgl.textarea.update:
+                                id: ta_nombre_z8
+                                text: !lambda return id(nombre_zona8);
+                            - lvgl.widget.show: popup_nombre_z8
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+
+                    - button:
+                        id: spin_up_z8
+                        width: 20
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: spin_zona8_inicio
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+                              
+        # Nombres de zonas
+
+        - obj:
+            id: popup_nombre_z1
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 1"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z1
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 1"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z1
+                  textarea: ta_nombre_z1
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z1
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z1
+        
+        - obj:
+            id: popup_nombre_z2
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 2"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z2
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 2"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z2
+                  textarea: ta_nombre_z2
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z2
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z2
+
+        - obj:
+            id: popup_nombre_z3
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 3"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z3
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 3"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z3
+                  textarea: ta_nombre_z3
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z3
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z3
+        
+        - obj:
+            id: popup_nombre_z4
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 4"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z4
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 4"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z4
+                  textarea: ta_nombre_z4
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z4
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z4
+
+        - obj:
+            id: popup_nombre_z5
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 5"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z5
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 1"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z5
+                  textarea: ta_nombre_z5
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z5
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z5
+
+        - obj:
+            id: popup_nombre_z6
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 6"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z6
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 6"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z6
+                  textarea: ta_nombre_z6
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z6
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z6
+
+        - obj:
+            id: popup_nombre_z7
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 7"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z7
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 7"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z7
+                  textarea: ta_nombre_z7
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z7
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z7
+        
+        - obj:
+            id: popup_nombre_z8
+            hidden: true
+            align: CENTER
+            width: 100%
+            height: 220
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: -7
+                  text: "Nombre de la zona 8"
+                  text_color: 0xFFFFFF
+              - textarea:
+                  id: ta_nombre_z8
+                  align: TOP_MID
+                  y: 10
+                  width: 200
+                  height: 40
+                  one_line: true
+                  text: "Zona 8"
+                  text_color: 0x6B6969
+              - keyboard:
+                  id: kb_z8
+                  textarea: ta_nombre_z8
+                  #mode: TEXT_UPPER
+                  height: 140
+                  y: 10
+                  radius: 12
+                  on_ready:
+                    then:
+                      - script.execute: cerrar_popup_z8
+                  on_cancel:
+                    then:
+                      - script.execute: cerrar_popup_z8
+
+    - id: pagina_ajustes
+      widgets:
+        - container:
+            align: top_mid
+            width: 100%
+            height: 172
+            y: 30
+            pad_all: 0
+            #border_color: 0xFF0000
+            #border_width: 2
+            bg_opa: TRANSP
+            border_opa: TRANSP
+            scrollable: false
+            scroll_dir: NONE
+            layout:
+              type: GRID
+              grid_rows:
+                - FR(1)
+                - FR(1)
+                - FR(1)
+              grid_columns:
+                - FR(1)
+                - FR(1)
+              pad_row: 2
+              pad_column: 2
+            widgets:
+              - obj:
+                  id: config_1
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: CENTER
+                  bg_opa: TRANSP
+                  border_opa: TRANSP
+                  scrollable: false
+                  widgets:
+                    - label:
+                        id: dm_lbl_pantalla
+                        align: CENTER
+                        y: -10
+                        text_font: montserrat_24
+                        text: 'Pantalla'
+              - obj:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: CENTER
+                  scrollable: false
+                  scroll_dir: NONE
+                  bg_opa: TRANSP
+                  border_opa: TRANSP
+                  widgets:
+                    - container:
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: SPACE_EVENLY
+                          flex_align_cross: CENTER
+                        widgets:
+                          - label:
+                              id: brillo_ico
+                              align: LEFT_MID
+                              text_color: 0x000000
+                              text_font: materialdesignicons_34
+                              text: "\U000F0CF2"
+                          - label:
+                              id: dm_lbl_brillo
+                              align: CENTER
+                              y: 10
+                              text: 'Brillo'
+                              text_font: montserrat_18
+                              text_align: LEFT
+                              long_mode: CLIP
+                          - label:
+                              id: dm_dato_brillo
+                              align: CENTER
+                              x: 10%
+                              y: 5
+                              width: 60
+                              height: 24
+                              text: '75%'
+                              text_color: 0x000000
+                              text_font: montserrat_20
+                              text_align: RIGHT
+                              long_mode: CLIP
+                              
+                    - slider:
+                        id: dm_brillo_slider
+                        align: top_mid
+                        width: 95%
+                        height: 47
+                        y: -5
+                        value: 75
+                        min_value: 0
+                        max_value: 100
+                        indicator:
+                          bg_color: 0xFBBF24
+                          bg_opa: 35%
+                          shadow_color: 0xFBBF24
+                          shadow_opa: cover
+                          shadow_spread: 1
+                          shadow_width: 4
+                          radius: 8
+                        knob:
+                          bg_color: 0xFFFFFF
+                          bg_opa: 85%
+                          border_width: 2
+                          border_color: 0x58ED22
+                          radius: 50
+                          pad_all: 0
+                        animated: true
+                        on_value:
+                          then:
+                            - globals.set:
+                                id: brillo_pantalla
+                                value: !lambda return x / 100.0;
+                            - light.turn_on:
+                                id: display_backlight
+                                brightness: !lambda return x / 100.0;
+                            - lvgl.label.update:
+                                id: dm_dato_brillo
+                                text: !lambda return str_sprintf("%d%%", (int)x);
+              - obj:
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: CENTER
+                  bg_opa: TRANSP
+                  border_opa: TRANSP
+                  widgets:
+                    - container:
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: SPACE_EVENLY
+                          flex_align_cross: CENTER
+                        widgets:
+                          - label:
+                              id: brillo_tiempo_ico
+                              align: LEFT_MID
+                              text_color: 0x000000
+                              text_font: materialdesignicons_34
+                              text: "\U000F154A"
+                          - label:
+                              id: dm_lbl_tiempo_brillo
+                              align: CENTER
+                              y: 10
+                              text: 'Tiempo'
+                              text_font: montserrat_18
+                              text_align: LEFT
+                              #long_mode: CLIP
+                          - label:
+                              id: dm_dato_brillo_tiempo
+                              align: CENTER
+                              x: 10%
+                              y: 5
+                              width: 60
+                              height: 24
+                              text: '45sg'
+                              text_color: 0x000000
+                              text_font: montserrat_20
+                              text_align: RIGHT
+                              #long_mode: CLIP
+                    - slider:
+                        id: dm_brillo_tiempo_slider
+                        align: top_mid
+                        width: 95%
+                        height: 47
+                        y: -5
+                        value: 45
+                        min_value: 0
+                        max_value: 60
+                        indicator:
+                          bg_color: 0xFBBF24
+                          bg_opa: 35%
+                          shadow_color: 0xFBBF24
+                          shadow_opa: cover
+                          shadow_spread: 1
+                          shadow_width: 4
+                          radius: 8
+                        knob:
+                          bg_color: 0xFFFFFF
+                          bg_opa: 85%
+                          border_width: 2
+                          border_color: 0x58ED22
+                          radius: 50
+                          pad_all: 0
+                        animated: true
+                        on_value:
+                          then:
+                            - lvgl.label.update:
+                                id: dm_dato_brillo_tiempo
+                                text: !lambda return str_sprintf("%ds", (int)x);
+
+              # --- COLUMNA DERECHA: RIEGO ---
+              - obj:
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  bg_opa: TRANSP
+                  border_opa: TRANSP
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: CENTER
+                        y: -10
+                        text_font: montserrat_24
+                        text: 'Riego'
+              - obj:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: CENTER
+                  scrollable: false
+                  scroll_dir: NONE
+                  bg_opa: TRANSP
+                  border_opa: TRANSP
+                  widgets:
+                    - container:
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: SPACE_EVENLY
+                          flex_align_cross: CENTER
+                        widgets:
+                          - label:
+                              id: una_ronda_ico
+                              align: LEFT_MID
+                              text_color: 0xF57F02
+                              text_font: materialdesignicons_34
+                              text: "\U000F0DBB"
+                          - label:
+                              id: lbl_1_ronda
+                              align: CENTER
+                              y: 10
+                              text: '1 Ronda'
+                              text_font: montserrat_18
+                              text_align: LEFT
+
+                    - button:
+                        id: btn_1_ronda
+                        width: 95%
+                        height: 40
+                        y: -5
+                        pad_top: 0
+                        pad_bottom: 0
+                        bg_color: 0xFBBF24
+                        bg_opa: 35%
+                        shadow_color: 0xFBBF24
+                        shadow_opa: cover
+                        shadow_spread: 1
+                        shadow_width: 4
+                        checked:
+                          bg_opa: 45%
+                          shadow_color: 0xFBBF24
+                          shadow_opa: cover
+                          shadow_spread: 1
+                          shadow_width: 4
+                          bg_color: 0x1F8F3A
+                          bg_grad_color: 0x0B5E22
+                          text_color: 0xFFFFFF
+                        on_click:
+                          then:                      
+                            - globals.set:
+                                id: factor_lluvia
+                                value: "1.0"
+                            - script.execute: ejecutar_programa
+              - obj:
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: CENTER
+                  scrollable: false
+                  scroll_dir: NONE
+                  bg_opa: TRANSP
+                  border_opa: TRANSP
+                  widgets:
+                    - label:
+                        id: multiplicador_ico
+                        text_color: 0xF57F02
+                        x: -16
+                        y: -22
+                        text_font: materialdesignicons_34
+                        text: "\U000F058E"
+                    - label:
+                        id: lbl_multiplicador
+                        text: 'X tiempo'
+                        x: 16
+                        y: -12
+                        text_font: montserrat_14
+                        text_align: LEFT
+                    - label:
+                        id: saltar_dias_ico
+                        text_color: 0xF57F02
+                        x: 103
+                        y: -22
+                        text_font: materialdesignicons_34
+                        text: "\U000F01B7"
+                    - label:
+                        id: lbl_saltar_dias
+                        text: 'Saltar dias'
+                        x: 137
+                        y: -12
+                        text_font: montserrat_14
+                        text_align: LEFT
+        - container:
+            align: right_mid
+            width: 50%
+            height: 45%
+            y: 0
+            pad_all: 4
+            layout:
+              type: GRID
+              pad_row: 2
+              pad_column: 4
+
+              grid_rows:
+                - FR(2)
+                - FR(2)
+              grid_columns:
+                - FR(2)
+                - FR(2)
+            widgets:
+              - container:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  #width: 100%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_multi
+                        width: 30
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: dm_multiplicador_spinbox
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: dm_multiplicador_spinbox
+                        width: 55
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 120
+                        value: 100
+                        rollover: true
+                        digits: 3
+                        decimal_places: 0
+                        clickable: false
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+                    - button:
+                        id: spin_up_multi
+                        width: 30
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: dm_multiplicador_spinbox
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+                        
+              - container:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  #width: 90%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: spin_down_saltar_dias
+                        width: 30
+                        height: 40
+                        on_click:
+                          - lvgl.spinbox.decrement: dm_saltar_dias_spinbox
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: dm_saltar_dias_spinbox
+                        width: 50
+                        height: 40
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 10
+                        rollover: true
+                        digits: 2
+                        decimal_places: 0
+                        clickable: false
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+                    - button:
+                        id: spin_up_saltar_dias
+                        width: 30
+                        height: 40
+                        text_align: CENTER
+                        on_click:
+                          - lvgl.spinbox.increment: dm_saltar_dias_spinbox
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+        - button:
+            id: reloj_config
+            width: 150
+            height: 50
+            align: bottom_left
+            x: 20
+            y: -40
+            bg_opa: TRANSP
+            border_color: 0x13ED3D
+            border_width: 1
+            radius: 12
+            on_click:
+              then:
+                - lvgl.widget.show: popup_set_hora
+            widgets:
+              - label:
+                  align: left_mid
+                  text_color: 0x46494D
+                  text: "Reloj:"
+              - label:
+                  id: lbl_reloj_config
+                  align: center
+                  x: 30
+                  text_color: 0xF57F02
+                  text: "--:--:--"
+
+        - button:
+            id: btn_lluvia_ajustes
+            width: 150
+            height: 36
+            align: BOTTOM_RIGHT
+            x: -20
+            y: -40
+            bg_opa: TRANSP
+            border_color: 0x13ED3D
+            border_width: 1
+            radius: 12
+            on_click:
+              - lvgl.page.show: pagina_lluvia
+            widgets:
+              - label:
+                  align: LEFT_MID
+                  text_color: 0xF57F02
+                  text_font: materialdesignicons_28
+                  text: "\U000F0597"  # weather-rainy
+              - label:
+                  align: CENTER
+                  x: 14
+                  text_color: 0x46494D
+                  text: "Lluvia"
+        - button:
+            id: btn_qr
+            width: 50
+            height: 50
+            align: BOTTOM_MID
+            x: -30
+            y: -40
+            bg_color: 0x000000
+            bg_opa: TRANSP
+            border_color: 0x13ED3D
+            border_width: 1
+            radius: 12
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "FH"
+              - label:
+                  align: CENTER
+                  text_color: 0x000000
+                  text_font: materialdesignicons_34
+                  text: "\U000F0433"  # qrcode-scan
+            on_click:
+              - lvgl.qrcode.update:
+                  id: fh_qr_widget
+                  text: "WIFI:T:WPA;S:${hostname} FH;P:${ap};;"
+              - lvgl.widget.show: dm_fh_qr
+        - obj:
+            id: dm_fh_qr
+            hidden: true
+            width: 100%
+            height: 260
+            align: CENTER
+            bg_color: 0xFFFFFF
+            bg_opa: COVER
+            radius: 12
+            widgets:
+              - qrcode:
+                  id: fh_qr_widget
+                  size: 180
+                  align: CENTER
+                  y: 0
+              - label:
+                  align: TOP_RIGHT
+                  text_color: 0xF57F02
+                  text: "${ap}"
+                  y: 20
+              - button:
+                  align: BOTTOM_RIGHT
+                  width: 40
+                  height: 40
+                  y: -10
+                  bg_opa: TRANSP
+                  widgets:
+                    - label:
+                        align: center
+                        text_color: 0xF57F02
+                        text_font: materialdesignicons_34
+                        text: "\U000F0157" # close-box
+                  on_click:
+                    - lvgl.widget.hide: dm_fh_qr
+        - obj:
+            id: popup_set_hora
+            hidden: true
+            align: CENTER
+            width: 90%
+            height: 180
+            radius: 12
+            bg_color: 0x2A2A2A
+            border_color: 0x2FBF4A
+            border_width: 1
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: 5
+                  text: "Hora del reloj"
+                  text_color: 0xFFFFFF
+              - label:
+                  id: lbl_hora_info
+                  align: CENTER
+                  y: -15
+                  width: 90%
+                  text_align: CENTER
+                  text_color: 0xFFFFFF
+                  long_mode: WRAP
+                  text: "Sin sincronizar con internet.\nConecta el WiFi (vale el del movil)."
+              - container:
+                  align: BOTTOM_MID
+                  y: -8
+                  width: 90%
+                  height: 40
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_EVENLY
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        width: 160
+                        height: 35
+                        on_click:
+                          - component.update: sntp_time
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text: "Sincronizar ahora"
+                    - button:
+                        width: 100
+                        height: 35
+                        on_click:
+                          - lvgl.widget.hide: popup_set_hora
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text: "Cerrar"
+    # Configuración del sensor de lluvia (se llega desde Ajustes > Lluvia)
+    - id: pagina_lluvia
+      widgets:
+        - container:
+            align: top_mid
+            width: 100%
+            height: 198
+            y: 30
+            pad_all: 4
+            bg_opa: TRANSP
+            border_opa: TRANSP
+            scrollable: false
+            scroll_dir: NONE
+            layout:
+              type: GRID
+              grid_rows:
+                - FR(1)
+                - FR(1)
+                - FR(1)
+                - FR(1)
+                - FR(1)
+              grid_columns:
+                - FR(5)
+                - FR(4)
+              pad_row: 2
+              pad_column: 4
+            widgets:
+              - button:
+                  id: btn_lluvia_activa
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  on_click:
+                    - switch.toggle: lluvia_activa
+                  widgets:
+                    - label:
+                        id: lbl_lluvia_activa
+                        align: CENTER
+                        text_font: montserrat_18
+                        text: "Sensor: ACTIVO"
+              - label:
+                  id: lbl_lluvia_24h
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: CENTER
+                  grid_cell_y_align: CENTER
+                  text_color: 0xF57F02
+                  text_font: montserrat_20
+                  text: "24 h: -- min"
+              - label:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: START
+                  grid_cell_y_align: CENTER
+                  text_font: montserrat_18
+                  text: "Reducir desde (min)"
+              - container:
+                  grid_cell_row_pos: 1
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        width: 40
+                        height: 34
+                        on_click:
+                          - lvgl.spinbox.update:
+                              id: spin_lluvia_reducir
+                              value: !lambda return (float) (lv_spinbox_get_value(id(spin_lluvia_reducir)) - 5);
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_lluvia_reducir
+                        width: 70
+                        height: 34
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 240
+                        value: 10
+                        digits: 3
+                        decimal_places: 0
+                        clickable: false
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+                    - button:
+                        width: 40
+                        height: 34
+                        on_click:
+                          - lvgl.spinbox.update:
+                              id: spin_lluvia_reducir
+                              value: !lambda return (float) (lv_spinbox_get_value(id(spin_lluvia_reducir)) + 5);
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+              - label:
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: START
+                  grid_cell_y_align: CENTER
+                  text_font: montserrat_18
+                  text: "Riego reducido (%)"
+              - container:
+                  grid_cell_row_pos: 2
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        width: 40
+                        height: 34
+                        on_click:
+                          - lvgl.spinbox.update:
+                              id: spin_lluvia_factor
+                              value: !lambda return (float) (lv_spinbox_get_value(id(spin_lluvia_factor)) - 5);
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_lluvia_factor
+                        width: 70
+                        height: 34
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 100
+                        value: 50
+                        digits: 3
+                        decimal_places: 0
+                        clickable: false
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+                    - button:
+                        width: 40
+                        height: 34
+                        on_click:
+                          - lvgl.spinbox.update:
+                              id: spin_lluvia_factor
+                              value: !lambda return (float) (lv_spinbox_get_value(id(spin_lluvia_factor)) + 5);
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+              - label:
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: START
+                  grid_cell_y_align: CENTER
+                  text_font: montserrat_18
+                  text: "Saltar desde (min)"
+              - container:
+                  grid_cell_row_pos: 3
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        width: 40
+                        height: 34
+                        on_click:
+                          - lvgl.spinbox.update:
+                              id: spin_lluvia_saltar
+                              value: !lambda return (float) (lv_spinbox_get_value(id(spin_lluvia_saltar)) - 5);
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0140"  # chevron-down
+                    - spinbox:
+                        id: spin_lluvia_saltar
+                        width: 70
+                        height: 34
+                        text_align: CENTER
+                        range_from: 0
+                        range_to: 720
+                        value: 45
+                        digits: 3
+                        decimal_places: 0
+                        clickable: false
+                        cursor:
+                          bg_opa: TRANSP
+                          border_opa: TRANSP
+                          text_color: 0x4C4B4B
+                          text_opa: COVER
+                    - button:
+                        width: 40
+                        height: 34
+                        on_click:
+                          - lvgl.spinbox.update:
+                              id: spin_lluvia_saltar
+                              value: !lambda return (float) (lv_spinbox_get_value(id(spin_lluvia_saltar)) + 5);
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: materialdesignicons_18
+                              text: "\U000F0143"  # chevron-up
+              - label:
+                  id: lbl_lluvia_decision
+                  grid_cell_row_pos: 4
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: CENTER
+                  width: 100%
+                  text_font: montserrat_14
+                  long_mode: SCROLL_CIRCULAR
+                  text: "Ultima: sin decisiones todavia"
+              - button:
+                  grid_cell_row_pos: 4
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: STRETCH
+                  grid_cell_y_align: STRETCH
+                  on_long_press:
+                    - script.execute: borrar_historial_lluvia
+                  widgets:
+                    - label:
+                        align: CENTER
+                        text_font: montserrat_14
+                        text: "Borrar (mantener)"
+interval:
+  - interval: 1s
+    then:
+      # actualizar reloj
+      - lvgl.label.update:
+          id: lbl_reloj
+          text:
+            format: "%02d:%02d:%02d"
+            args:
+              - id(rtc_time).now().hour
+              - id(rtc_time).now().minute
+              - id(rtc_time).now().second
+      - lvgl.label.update:
+          id: lbl_reloj_config
+          text:
+            format: "%02d:%02d:%02d"
+            args:
+              - id(rtc_time).now().hour
+              - id(rtc_time).now().minute
+              - id(rtc_time).now().second
+
+      # Riego AUTOMÁTICO: aquí solo se detecta la hora de inicio; la decisión
+      # (normal / reducido / saltado) la toma el script decidir_riego.
+      # El riego manual (zonas, "1 Ronda") no pasa por aquí y no mira la lluvia.
+      - lambda: |-
+          auto ahora = id(rtc_time).now();
+          if (!ahora.is_valid()) return;
+
+          // Si está lloviendo justo ahora, no se arranca ningún programa (solo con el sensor activado)
+          if (id(lluvia_activa).state && id(sensor_lluvia).state) return;
+
+          int current_day = ahora.timestamp / 86400;
+          if ((current_day - id(var_dias_saltar_inicio)) % ((int)id(saltar_dias).state + 1) != 0) return;
+
+          if (id(ejecutar_programa).is_running() || id(decidir_riego).is_running()) return;
+
+          auto time_str = ahora.strftime("%H:%M");
+          bool toca = (id(programa_1).state && time_str == id(programa_1_inicio).current_option()) ||
+                      (id(programa_2).state && time_str == id(programa_2_inicio).current_option()) ||
+                      (id(programa_3).state && time_str == id(programa_3_inicio).current_option()) ||
+                      (id(programa_4).state && time_str == id(programa_4_inicio).current_option());
+          if (!toca) return;
+
+          // Evaluar una sola vez por minuto (evita repetir la decisión 60 veces)
+          uint32_t minuto = ahora.timestamp / 60;
+          if (minuto == id(ultimo_minuto_eval)) return;
+          id(ultimo_minuto_eval) = minuto;
+
+          id(decidir_riego).execute();
+
+  # Contador de lluvia: ventana deslizante de 24 h con un bucket de segundos por hora
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto ahora = id(rtc_time).now();
+          if (!ahora.is_valid()) return;
+          uint32_t ts = ahora.timestamp;
+          uint32_t hora = ts / 3600;
+
+          // Avanzar el buffer: vaciar las horas que han pasado desde la última vez
+          uint32_t ultima = id(lluvia_hora_abs);
+          if (ultima == 0) {
+            for (int i = 0; i < 24; i++) id(lluvia_seg_hora)[i] = 0;
+          } else if (hora > ultima) {
+            uint32_t pasos = hora - ultima;
+            if (pasos > 24) pasos = 24;
+            for (uint32_t k = 1; k <= pasos; k++) id(lluvia_seg_hora)[(ultima + k) % 24] = 0;
+          }
+          id(lluvia_hora_abs) = hora;
+
+          // El sensor está en alto: el riego no lo moja, así que cuenta toda la lluvia real
+          if (id(lluvia_activa).state && id(sensor_lluvia).state) id(lluvia_seg_hora)[hora % 24]++;
+
+script:
+  #Temporizador de inactividad de pantalla.
+  - id: inactivity_timer
+    mode: restart
+    then:
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+            - delay: 200ms
+      - if:
+          condition:
+            light.is_off: display_backlight
+          then:
+            - light.turn_on:
+                id: display_backlight
+                brightness: !lambda return id(brillo_pantalla);
+      - delay: !lambda 'return id(sleep_time).state * 1000;'
+      - globals.set:
+          id: pantalla_durmiendo
+          value: "true"
+      - lvgl.page.show: pagina_inicio
+      - light.turn_off:
+          id: display_backlight
+      # Anti burn-in del LCD: con la pantalla apagada se pausa LVGL y se pinta
+      # "nieve" (ruido aleatorio) para que el panel no pase días con la misma imagen.
+      # Se reanuda solo al tocar (ver on_touch del touchscreen).
+      - lvgl.pause:
+          show_snow: true
+  
+  # Textos de zonas
+  - id: cerrar_popup_z1
+    then:
+      - lvgl.widget.hide: popup_nombre_z1
+
+  - id: cerrar_popup_z2
+    then:
+      - lvgl.widget.hide: popup_nombre_z2
+
+  - id: cerrar_popup_z3
+    then:
+      - lvgl.widget.hide: popup_nombre_z3
+
+  - id: cerrar_popup_z4
+    then:
+      - lvgl.widget.hide: popup_nombre_z4
+
+  - id: cerrar_popup_z5
+    then:
+      - lvgl.widget.hide: popup_nombre_z5
+
+  - id: cerrar_popup_z6
+    then:
+      - lvgl.widget.hide: popup_nombre_z6
+      
+  - id: cerrar_popup_z7
+    then:
+      - lvgl.widget.hide: popup_nombre_z7
+
+  - id: cerrar_popup_z8
+    then:
+      - lvgl.widget.hide: popup_nombre_z8
+          
+  - id: zona1_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[0] = (int) roundf(id(zona1_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona1_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[0] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[0] -= 1;
+                id(zona1_restante).update();
+
+  - id: zona2_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[1] = (int) roundf(id(zona2_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona2_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[1] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[1] -= 1;
+                id(zona2_restante).update();
+
+  - id: zona3_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[2] = (int) roundf(id(zona3_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona3_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[2] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[2] -= 1;
+                id(zona3_restante).update();
+
+  - id: zona4_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[3] = (int) roundf(id(zona4_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona4_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[3] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[3] -= 1;
+                id(zona4_restante).update();
+
+  - id: zona5_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[4] = (int) roundf(id(zona5_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona5_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[4] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[4] -= 1;
+                id(zona5_restante).update();
+
+  - id: zona6_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[5] = (int) roundf(id(zona6_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona6_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[5] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[5] -= 1;
+                id(zona6_restante).update();
+
+  - id: zona7_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[6] = (int) roundf(id(zona7_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona7_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[6] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[6] -= 1;
+                id(zona7_restante).update();
+
+  - id: zona8_espera
+    then:
+      - lambda: |-
+          id(var_zona_restante)[7] = (int) roundf(id(zona8_duracion).state * id(multiplicador_tiempo).state / 100.0f * id(factor_lluvia));
+          id(zona8_restante).update();
+      - while:
+          condition:
+            lambda: "return id(var_zona_restante)[7] > 0;"
+          then:
+            - delay: 1min
+            - lambda: |-
+                id(var_zona_restante)[7] -= 1;
+                id(zona8_restante).update();
+
+  # Borra el histórico de lluvia de las últimas 24 h (botón de pantalla y de HA)
+  - id: borrar_historial_lluvia
+    mode: single
+    then:
+      - lambda: |-
+          for (int i = 0; i < 24; i++) id(lluvia_seg_hora)[i] = 0;
+          id(lluvia_24h).update();
+
+  # Decisión del riego automático según los minutos de lluvia de las últimas 24 h
+  - id: decidir_riego
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(lluvia_activa).state) {
+            id(decision_lluvia) = 2;
+            id(factor_lluvia) = 1.0f;
+            std::string t = "Sensor lluvia OFF: riego normal";
+            ESP_LOGI("riego", "Decisión automática: %s", t.c_str());
+            id(decision_riego_txt).publish_state(t);
+            return;
+          }
+          int seg = 0;
+          for (int i = 0; i < 24; i++) seg += id(lluvia_seg_hora)[i];
+          int min_lluvia = (int) roundf(seg / 60.0f);
+          float u_reducir = id(lluvia_umbral_reducir).state;
+          float u_saltar = id(lluvia_umbral_saltar).state;
+          std::string txt;
+          if (u_saltar > 0 && min_lluvia >= u_saltar) {
+            id(decision_lluvia) = 0;
+            id(factor_lluvia) = 1.0f;
+            txt = str_sprintf("Saltado: %d min de lluvia", min_lluvia);
+          } else if (u_reducir > 0 && min_lluvia >= u_reducir) {
+            int pct = (int) id(lluvia_factor_reducido).state;
+            id(decision_lluvia) = 1;
+            id(factor_lluvia) = pct / 100.0f;
+            txt = str_sprintf("Riego al %d%%: %d min de lluvia", pct, min_lluvia);
+          } else {
+            id(decision_lluvia) = 2;
+            id(factor_lluvia) = 1.0f;
+            txt = str_sprintf("Riego normal (%d min de lluvia)", min_lluvia);
+          }
+          ESP_LOGI("riego", "Decisión automática: %s", txt.c_str());
+          id(decision_riego_txt).publish_state(txt);
+      - if:
+          condition:
+            lambda: return id(decision_lluvia) != 0;
+          then:
+            - script.execute: ejecutar_programa
+          else:
+            - lvgl.label.update:
+                id: lbl_estado
+                text: !lambda return id(decision_riego_txt).state;
+
+  # Riego.
+  - id: ejecutar_programa
+    mode: single
+    then:
+      - lvgl.widget.update:
+            id: btn_1_ronda
+            state:
+              checked: true
+      - switch.turn_on: riego_zona1
+      - script.wait: zona1_espera
+      - delay: 250ms
+      - switch.turn_on: riego_zona2
+      - script.wait: zona2_espera
+      - delay: 250ms
+      - switch.turn_on: riego_zona3
+      - script.wait: zona3_espera
+      - delay: 250ms
+      - switch.turn_on: riego_zona4
+      - script.wait: zona4_espera
+      - delay: 250ms
+      - switch.turn_on: riego_zona5
+      - script.wait: zona5_espera
+      - delay: 250ms
+      - switch.turn_on: riego_zona6
+      - script.wait: zona6_espera
+      - delay: 250ms
+      - switch.turn_on: riego_zona7
+      - script.wait: zona7_espera
+      - delay: 250ms
+      - switch.turn_on: riego_zona8
+      - script.wait: zona8_espera
+      - lvgl.widget.update:
+            id: btn_1_ronda
+            state:
+              checked: false
+      - globals.set:
+          id: factor_lluvia
+          value: "1.0"
