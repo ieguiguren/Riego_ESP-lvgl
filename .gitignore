@@ -1,0 +1,5 @@
+.esphome-dev/
+.esphome/
+secrets.yaml
+brag-output/
+fonts/*.ttf

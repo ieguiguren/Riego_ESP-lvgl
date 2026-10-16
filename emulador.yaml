@@ -1,0 +1,107 @@
+# Emulador en Linux (plataforma host + ventana SDL). Reutiliza el YAML real y
+# sustituye solo el hardware que no existe en el PC.
+# Requiere esphome y libsdl2-dev (sudo apt install libsdl2-dev). Uso:
+#   esphome run emulador.yaml      (abre una ventana 480x272; el ratón hace de dedo)
+# Mantener pulsada la tecla R en la ventana simula lluvia.
+packages:
+  riego: !include riego-esp-lvgl.yaml
+
+# ---- Plataforma ------------------------------------------------------
+esp32: !remove
+psram: !remove
+wifi: !remove
+ota: !remove
+captive_portal: !remove
+spi: !remove
+i2c: !remove
+xl9535: !remove
+
+host:
+
+# ---- Reloj: la hora del PC en lugar del PCF8563 -------------------------
+time:
+  - id: !remove rtc_time
+  - id: rtc_time
+    platform: host
+    i2c_id: !remove
+  - id: !remove sntp_time
+  - id: sntp_time
+    platform: host
+    servers: !remove
+    on_time_sync: !remove
+
+# ---- Pantalla y táctil (ratón) -------------------------------------------
+display:
+  - id: !extend my_display
+    platform: sdl
+    dimensions:
+      width: 480
+      height: 272
+    model: !remove
+    bus_mode: !remove
+    cs_pin: !remove
+    invert_colors: !remove
+
+touchscreen:
+  - id: !extend my_touchscreen
+    platform: sdl
+    i2c_id: !remove
+    interrupt_pin: !remove
+
+output:
+  - id: !extend gpio_backlight_pwm
+    platform: template
+    type: float
+    write_action:
+      - lambda: ;
+    pin: !remove
+    frequency: !remove
+
+# ---- Relés: switches simulados --------------------------------------------
+switch:
+  - id: !extend riego_canal1
+    platform: template
+    optimistic: true
+    pin: !remove
+  - id: !extend riego_canal2
+    platform: template
+    optimistic: true
+    pin: !remove
+  - id: !extend riego_canal3
+    platform: template
+    optimistic: true
+    pin: !remove
+  - id: !extend riego_canal4
+    platform: template
+    optimistic: true
+    pin: !remove
+  - id: !extend riego_canal5
+    platform: template
+    optimistic: true
+    pin: !remove
+  - id: !extend riego_canal6
+    platform: template
+    optimistic: true
+    pin: !remove
+  - id: !extend riego_canal7
+    platform: template
+    optimistic: true
+    pin: !remove
+  - id: !extend riego_canal8
+    platform: template
+    optimistic: true
+    pin: !remove
+
+binary_sensor:
+  - id: !extend sensor_lluvia
+    platform: template
+    pin: !remove
+    filters: !remove
+  # Mantener pulsada la tecla R en la ventana = lloviendo
+  - id: tecla_lluvia
+    platform: sdl
+    key: SDLK_r
+    on_state:
+      - binary_sensor.template.publish:
+          id: sensor_lluvia
+          state: !lambda return x;
